@@ -7,6 +7,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -20,6 +21,12 @@ import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.lang.StringUtils;
+import org.graylog2.gelfclient.GelfConfiguration;
+import org.graylog2.gelfclient.GelfMessage;
+import org.graylog2.gelfclient.GelfMessageBuilder;
+import org.graylog2.gelfclient.GelfMessageLevel;
+import org.graylog2.gelfclient.GelfTransports;
+import org.graylog2.gelfclient.transport.GelfTransport;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -29,6 +36,10 @@ import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.synectiks.json.datagenerator.impl.JsonDataGeneratorImpl;
 import com.synectiks.json.datagenerator.impl.NonCloseableBufferedOutputStream;
 
@@ -61,6 +72,21 @@ public final class CLIMain {
             o.setRequired(false);
             options.addOption(kafkaTopic);
 
+        Option gelf = new Option("gelf", "gelf", true,
+                "gelf message.");
+            o.setRequired(false);
+            options.addOption(gelf);
+        
+        Option gelfHost = new Option("ghost", "ghost", true,
+                "gelf api server");
+            o.setRequired(false);
+            options.addOption(gelfHost);
+            
+        Option gelfPort = new Option("gport", "gport", true,
+                "gelf api port");
+            o.setRequired(false);
+            options.addOption(gelfPort);
+            
 //        o = new Option("d", "destinationFile", true,
 //            "the destination file.  Defaults to System.out");
 //        o.setRequired(false);
@@ -109,26 +135,55 @@ public final class CLIMain {
             	CommandLine cmd = parser.parse(options, args);
 
                 String source = cmd.getOptionValue("s");
-                if (source == null) {
-                    throw new ParseException("Missing required option: -s");
-                }
+//                if (source == null) {
+//                    throw new ParseException("Missing required option: -s");
+//                }
                 File sourceFile = new File(source);
                 if (!sourceFile.exists()) {
                     throw new FileNotFoundException(source + " cannot be found");
                 }
                 
                 String kafkaTopic = cmd.getOptionValue("kafkaTopic");
-                if(StringUtils.isBlank(kafkaTopic)) {
-                	throw new ParseException("Missing required option: -kafkaTopic");
+                if(!StringUtils.isBlank(kafkaTopic)) {
+//                	throw new ParseException("Missing required option: -kafkaTopic");
+                
+	                File tempDestinationFile = new File(System.getProperty("java.io.tmpdir")+"/"+sourceFile.getName()+".json");
+	        		String jsonString = generateRandomData(sourceFile, tempDestinationFile);
+	        		ResponseEntity<String> response = uploadDataToKafka(jsonString, tempDestinationFile, sourceFile.getName(), kafkaTopic);
+	                if(tempDestinationFile.exists()) {
+	                	tempDestinationFile.delete();
+	                }
                 }
                 
-                File tempDestinationFile = new File(System.getProperty("java.io.tmpdir")+"/"+sourceFile.getName()+".json");
-        		String jsonString = generateRandomData(sourceFile, tempDestinationFile);
-        		ResponseEntity<String> response = uploadDataToKafka(jsonString, tempDestinationFile, sourceFile.getName(), kafkaTopic);
-                if(tempDestinationFile.exists()) {
-                	tempDestinationFile.delete();
+                String gelf = cmd.getOptionValue("gelf");
+                if(!StringUtils.isBlank(gelf)) {
+                	System.out.println("Sending GELF TCP messages to logmanger");
+                	String ghost = cmd.getOptionValue("ghost");
+                	String gport = cmd.getOptionValue("gport");
+                	if(StringUtils.isBlank(ghost)) {
+                		throw new ParseException("Missing gelf server address: -ghost");
+                	}
+                	if(StringUtils.isBlank(gport)) {
+                		throw new ParseException("Missing gelf server port: -gport");
+                	}
+                	File tempDestinationFile = new File(System.getProperty("java.io.tmpdir")+"/"+sourceFile.getName()+".json");
+	        		String jsonString = generateRandomData(sourceFile, tempDestinationFile);
+	        		
+                	JsonArray ary = new Gson().fromJson(jsonString, JsonArray.class);
+                	
+                	for(JsonElement je: ary) {
+                		JsonObject jo = je.getAsJsonObject();
+                		String name = jo.get("name").getAsString();
+                		System.out.println("msg: "+name);
+                		GelfMessageBuilder gmBuilder = new GelfMessageBuilder(name, ghost).level(GelfMessageLevel.INFO);
+                		GelfMessage message = gmBuilder.build();
+                		getGelfTransport(ghost, Integer.parseInt(gport)).send(message);
+                	}
+                	
+            		
+            		System.out.println("GELF TCP messages successfully delivered to host : "+ghost+", port : "+gport);
                 }
-
+                
 //        		System.out.println(tempDestinationFile.getAbsolutePath());
 //                boolean interactiveMode = cmd.hasOption('i');
 //
@@ -175,6 +230,13 @@ public final class CLIMain {
 //        } finally {
 //            TimeZone.setDefault(DEFAULT_TIMEZONE);
 //        }
+            catch (NumberFormatException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
 
     }
 
@@ -237,4 +299,17 @@ public final class CLIMain {
         }
     }
 
+    public static GelfConfiguration getGelfConfiguration(String host, int port) {
+		return new GelfConfiguration(new InetSocketAddress(host, port))
+        .transport(GelfTransports.TCP)
+        .queueSize(512)
+        .connectTimeout(5000)
+        .reconnectDelay(1000)
+        .tcpNoDelay(true)
+        .sendBufferSize(32768);
+	}
+    
+    public static GelfTransport getGelfTransport(String host, int port) {
+		return GelfTransports.create(getGelfConfiguration(host, port));
+	}
 }
